@@ -19,7 +19,6 @@
 services:
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: aiona-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
@@ -42,7 +41,6 @@ services:
 
   redis:
     image: redis:7
-    container_name: aiona-redis
     restart: unless-stopped
     command: >
       --requirepass ${REDIS_PASSWORD}
@@ -58,7 +56,6 @@ services:
 
   minio:
     image: minio/minio
-    container_name: aiona-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -81,7 +78,6 @@ services:
   turn-config:
     # One-shot job: renders turnserver.conf for coturn from env vars, then exits.
     image: bash:5.2
-    container_name: aiona-turn-config
     environment:
       TURN_EXTERNAL_IP: "${TURN_HOST}"
       TURN_SECRET: "${TURN_SECRET}"
@@ -100,7 +96,6 @@ services:
 
   coturn:
     image: coturn/coturn:4.8.0
-    container_name: aiona-coturn
     restart: unless-stopped
     depends_on:
       turn-config:
@@ -119,7 +114,6 @@ services:
 
   api:
     image: ${REGISTRY:-dograhai}/dograh-api:latest
-    container_name: aiona-api
     restart: unless-stopped
     environment:
       ENVIRONMENT: "production"
@@ -177,7 +171,6 @@ services:
 
   ui:
     image: ${REGISTRY:-dograhai}/dograh-ui:latest
-    container_name: aiona-ui
     restart: unless-stopped
     environment:
       HOSTNAME: "0.0.0.0"
