@@ -1,0 +1,214 @@
+# =============================================================================
+# Aiona Voice V5 — Coolify deployment stack
+# Based on Dograh AI (https://github.com/dograh-hq/dograh), BSD-2-Clause.
+#
+# This compose file is adapted specifically for Coolify:
+#   - No bundled nginx/certbot — Coolify's own Traefik proxy handles HTTPS.
+#     Assign a Domain to the `ui`, `api`, and `minio` services from the
+#     Coolify UI (see README-DEPLOY.md) instead of editing this file.
+#   - No cloudflared tunnel — not needed since Coolify + Traefik already
+#     gives every service a public HTTPS endpoint.
+#   - Postgres/Redis/MinIO are NOT published to the host — internal
+#     Docker-network access only, reached by service name.
+#   - coturn (WebRTC TURN server) IS published directly on host ports,
+#     because Traefik cannot proxy raw UDP media relay traffic.
+#
+# Deploy with: Coolify -> New Resource -> Docker Compose -> point at this repo
+# =============================================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: aiona-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: postgres
+    volumes:
+      - aiona_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - aiona-network
+
+  redis:
+    image: redis:7
+    container_name: aiona-redis
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - aiona_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - aiona-network
+
+  minio:
+    image: minio/minio
+    container_name: aiona-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    volumes:
+      - aiona_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aiona-network
+    # In Coolify: open this service -> Domains -> set e.g. storage.yourdomain.com
+    # pointing at container port 9000. Needed so browsers can fetch call
+    # recordings/transcripts (presigned URLs) directly from MinIO.
+
+  turn-config:
+    # One-shot job: renders turnserver.conf for coturn from env vars, then exits.
+    image: bash:5.2
+    container_name: aiona-turn-config
+    environment:
+      TURN_EXTERNAL_IP: "${TURN_HOST}"
+      TURN_SECRET: "${TURN_SECRET}"
+    volumes:
+      - ./deploy/turnserver.conf.template:/template/turnserver.conf.template:ro
+      - aiona_coturn_generated:/generated
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        awk -v external_ip="$$TURN_EXTERNAL_IP" -v turn_secret="$$TURN_SECRET" '
+          { gsub(/__DOGRAH_TURN_EXTERNAL_IP__/, external_ip); gsub(/__DOGRAH_TURN_SECRET__/, turn_secret); print }
+        ' /template/turnserver.conf.template > /generated/turnserver.conf
+        echo "TURN config rendered for $$TURN_EXTERNAL_IP"
+    networks:
+      - aiona-network
+
+  coturn:
+    image: coturn/coturn:4.8.0
+    container_name: aiona-coturn
+    restart: unless-stopped
+    depends_on:
+      turn-config:
+        condition: service_completed_successfully
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      - "49152-49200:49152-49200/udp"
+    volumes:
+      - aiona_coturn_generated:/etc/coturn:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    networks:
+      - aiona-network
+
+  api:
+    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    container_name: aiona-api
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: "production"
+      LOG_LEVEL: "INFO"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-true}"
+
+      # Single canonical public origin for the API (set to your api.* domain)
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL}"
+      PUBLIC_HOST: "${PUBLIC_HOST}"
+      BACKEND_API_ENDPOINT: "${PUBLIC_BASE_URL}"
+
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      # Separate public domain for MinIO, since Traefik/Coolify routes per-service
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+
+      FASTAPI_WORKERS: "${FASTAPI_WORKERS:-6}"
+      FORWARDED_ALLOW_IPS: "*"
+
+      TURN_HOST: "${TURN_HOST}"
+      TURN_SECRET: "${TURN_SECRET}"
+      FORCE_TURN_RELAY: "${FORCE_TURN_RELAY:-false}"
+
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set to a strong secret}"
+
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/api/v1/health'').read()"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - aiona-network
+    # In Coolify: open this service -> Domains -> set e.g. api.yourdomain.com
+    # pointing at container port 8000.
+
+  ui:
+    image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    container_name: aiona-ui
+    restart: unless-stopped
+    environment:
+      HOSTNAME: "0.0.0.0"
+      BACKEND_URL: "http://api:8000"
+      NEXT_PUBLIC_BACKEND_URL: "${PUBLIC_BASE_URL}"
+      NODE_ENV: "oss"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-false}"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - aiona-network
+    # In Coolify: open this service -> Domains -> set e.g. app.yourdomain.com
+    # pointing at container port 3010. This is the main app URL you'll use.
+
+volumes:
+  aiona_postgres_data:
+  aiona_redis_data:
+  aiona_minio_data:
+  aiona_coturn_generated:
+
+networks:
+  aiona-network:
+    driver: bridge
