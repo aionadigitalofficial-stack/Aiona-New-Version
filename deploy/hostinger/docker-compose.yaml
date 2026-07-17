@@ -138,6 +138,7 @@ services:
   api:
     image: ${REGISTRY:-dograhai}/dograh-api:${DOGRAH_VERSION:-latest}
     restart: unless-stopped
+    command: ["sleep", "infinity"]
     environment:
       # production => drop private-IP host ICE candidates on a public VPS and
       # order TURN URIs UDP-first. Required for correct remote WebRTC.
